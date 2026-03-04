@@ -207,7 +207,7 @@ const safetySettings = [
     { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
 ];
 
-export async function extractTranscript(file, apiKey, modelId = "gemini-2.0-flash", totalDuration = 0, onProgress = null) {
+export async function extractTranscript(file, apiKey, modelId = "gemini-2.0-flash", totalDuration = 0, onProgress = null, signal = null) {
     // eslint-disable-next-line no-unused-vars
     const dummyDuration = totalDuration;
     if (!apiKey) throw new Error("API Key is required");
@@ -236,7 +236,7 @@ export async function extractTranscript(file, apiKey, modelId = "gemini-2.0-flas
 실제 음성이 종료되었거나 ${totalDuration.toFixed(1)}초 근방에 도달했다면, 무의미한 텍스트(환각)를 절대 지어내지 말고 즉각 \`[END_OF_AUDIO]\`를 한 줄 출력한 뒤 출력을 완전히 멈추십시오.
 `;
 
-        const streamResult = await model.generateContentStream([mediaData, dynamicPrompt]);
+        const streamResult = await model.generateContentStream([mediaData, dynamicPrompt], { signal });
 
         let fullText = "";
         let allMatches = [];
@@ -383,6 +383,10 @@ export async function extractTranscript(file, apiKey, modelId = "gemini-2.0-flas
         // 정규화는 위에서 자체적으로 하였으므로 추출 데이터 그대로 반환
         return allMatches.sort((a, b) => a.seconds - b.seconds);
     } catch (err) {
+        if (err.name === 'AbortError') {
+            console.log(`[Stage 1] Extracting Transcript cancelled by user.`);
+            throw err;
+        }
         console.error(`Stage 1 Error: `, err);
         const errStr = String(err.message || err);
         if (errStr.includes("RECITATION")) {

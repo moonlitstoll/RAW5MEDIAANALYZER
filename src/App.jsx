@@ -250,7 +250,7 @@ const App = () => {
 
   const videoRef = useRef(null);
   const activeIdxRef = useRef(-1);
-  const stage2AbortRef = useRef(null);
+  const abortControllersRef = useRef(new Map());
   const isGlobalLoopActiveRef = useRef(isGlobalLoopActive);
   const loopTargetIdxRef = useRef(null); // [Phase 4] 루프 고정 타겟 인덱스
   const lastActionTimeRef = useRef(0); // [4차 수정] 시간 기반 의도 보호 가드
@@ -440,13 +440,16 @@ const App = () => {
 
   const deleteCache = async (key) => {
     if (confirm('Delete this cached transcript?')) {
-      // 분석 중단 신호
-      if (stage2AbortRef.current) stage2AbortRef.current.abort();
+      // 분석 중단 신호: 캐시된 파일과 활성화된 파일의 이름이 같으면 중단할 수 있으나, 더 정확히 전체 중단하거나 해당 파일의 ID를 찾아야함.
+      // 편의상 캐시 삭제는 현재 진행 중인 작업과 충돌될 수 있으므로 (동일 파일명),
+      // 캐시 키에 해당하는 metadata 이름과 현재 활성 파일 이름이 같다면 중단 처리.
       const cachedStr = localStorage.getItem(key);
+      let deletedName = null;
       if (cachedStr) {
         try {
           const parsed = JSON.parse(cachedStr);
           const metadata = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed.metadata : null;
+          if (metadata && metadata.name) deletedName = metadata.name;
           if (metadata && metadata.name && metadata.size) {
             await mediaStore.deleteFile(metadata.name, metadata.size);
           }
@@ -454,6 +457,15 @@ const App = () => {
           console.error("Failed to delete media file from store:", e);
         }
       }
+
+      if (deletedName) {
+        const fileToAbort = files.find(f => f.file.name === deletedName);
+        if (fileToAbort && abortControllersRef.current.has(fileToAbort.id)) {
+          abortControllersRef.current.get(fileToAbort.id).abort();
+          abortControllersRef.current.delete(fileToAbort.id);
+        }
+      }
+
       localStorage.removeItem(key);
       setCacheKeys(prev => prev.filter(k => k !== key));
     }
@@ -463,7 +475,11 @@ const App = () => {
     const count = cacheKeys.length;
     if (confirm(`Clear all ${count} cached analysis files?`)) {
       // 분석 중단 신호
-      if (stage2AbortRef.current) stage2AbortRef.current.abort();
+      for (const controller of abortControllersRef.current.values()) {
+        controller.abort();
+      }
+      abortControllersRef.current.clear();
+
       cacheKeys.forEach(k => localStorage.removeItem(k));
       await mediaStore.clearAll();
       setCacheKeys([]);
@@ -895,6 +911,11 @@ const App = () => {
           // Update status to analyzing (redundant but safe)
           setFiles(prev => prev.map(p => p.id === fItem.id ? { ...p, isAnalyzing: true } : p));
 
+          // Set up AbortController for this file
+          const abortController = new AbortController();
+          abortControllersRef.current.set(fItem.id, abortController);
+          const signal = abortController.signal;
+
           let rawData;
           let fileDuration = 0;
           try {
@@ -906,8 +927,13 @@ const App = () => {
             rawData = await extractTranscript(fItem.file, apiKey, selectedModel, fileDuration, (incrementalData) => {
               // Real-time UI update
               setFiles(prev => prev.map(p => p.id === fItem.id ? { ...p, data: incrementalData } : p));
-            });
+            }, signal);
           } catch (apiError) {
+            abortControllersRef.current.delete(fItem.id);
+            if (apiError.name === 'AbortError') {
+              console.log(`[Stage 1] File ${fItem.file.name} cancelled during extraction.`);
+              return; // Simply exit if aborted
+            }
             throw new Error(`API Error (Stage 1): ${apiError.message}`);
           }
 
@@ -952,6 +978,9 @@ const App = () => {
           }
         }
       } catch (err) {
+        abortControllersRef.current.delete(fItem.id);
+        if (err.name === 'AbortError') return;
+
         console.error("Analysis Error", err);
         setFiles(prev => prev.map(p => p.id === fItem.id ? { ...p, error: "Analysis failed: " + err.message, isAnalyzing: false } : p));
       }
@@ -965,10 +994,12 @@ const App = () => {
   const runStage2 = async (fileId, fileInfo, transcript, apiKey, modelId) => {
     console.log(`[Stage 2] Starting FULL BATCH Analysis for file ${fileId}...`);
 
-    // 취소 컨트롤러 초기화
-    if (stage2AbortRef.current) stage2AbortRef.current.abort();
-    stage2AbortRef.current = new AbortController();
-    const { signal } = stage2AbortRef.current;
+    let abortController = abortControllersRef.current.get(fileId);
+    if (!abortController) {
+      abortController = new AbortController();
+      abortControllersRef.current.set(fileId, abortController);
+    }
+    const signal = abortController.signal;
 
     const updateGlobalState = (data) => {
       setFiles(prev => prev.map(f => f.id === fileId ? { ...f, data: [...data] } : f));
@@ -1063,9 +1094,11 @@ const App = () => {
   const removeFile = (id, e) => {
     e.stopPropagation();
     // 분석 중단 신호
-    if (activeFileId === id && stage2AbortRef.current) {
-      stage2AbortRef.current.abort();
+    if (abortControllersRef.current.has(id)) {
+      abortControllersRef.current.get(id).abort();
+      abortControllersRef.current.delete(id);
     }
+
     setFiles(prev => {
       // [메모리 누수 방지] 파일 제거 시 ObjectURL 해제
       const fileToRemove = prev.find(f => f.id === id);
@@ -1082,7 +1115,11 @@ const App = () => {
   const removeAllFiles = () => {
     if (confirm("Remove all active files?")) {
       // 분석 중단 신호
-      if (stage2AbortRef.current) stage2AbortRef.current.abort();
+      for (const controller of abortControllersRef.current.values()) {
+        controller.abort();
+      }
+      abortControllersRef.current.clear();
+
       // [메모리 누수 방지] 모든 활성 파일의 URL 일괄 해제
       files.forEach(f => { if (f.url) URL.revokeObjectURL(f.url); });
       setFiles([]);
